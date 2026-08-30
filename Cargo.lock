@@ -1379,7 +1379,7 @@ dependencies = [
 
 [[package]]
 name = "taiga-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "assert_cmd",
  "chrono",
@@ -1399,7 +1399,7 @@ dependencies = [
 
 [[package]]
 name = "taiga-client"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "futures",
