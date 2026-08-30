@@ -8,23 +8,27 @@ Rust CLI and reusable async client for the [Taiga REST API](https://docs.taiga.i
 - Projects, memberships, roles, statistics, user stories, tasks, issues, epics, milestones, wiki, search, notifications, and timelines.
 - Optimistic-concurrency updates using Taiga resource versions.
 - Project-scoped and all-visible-project full-text search.
-- GitHub release archives for Linux x86_64, Windows x86_64, Intel macOS, and Apple Silicon macOS.
+- Precompiled binaries published as GitHub release archives for Linux x86_64, Windows x86_64, Intel macOS, and Apple Silicon macOS.
+
+## Install
+
+Download a precompiled archive from the [GitHub releases](https://github.com/andersou/taiga-cli-rs/releases) page and place the `taiga` binary on your `PATH`. Each release ships archives for the four supported targets plus a `SHA256SUMS` file for verification.
+
+To build from source instead, see the sections below.
 
 ## Requirements
 
-- Rust 1.98.0 managed by [vfox](https://vfox.lhan.me/).
+- Rust 1.98.0 or newer. Install it however you prefer: [rustup](https://rustup.rs/) or any other toolchain manager works. If you use [vfox](https://vfox.lhan.me/), the repository ships a `.vfox.toml` and the command below selects the pinned toolchain — but vfox is only a suggestion, not a requirement.
 - A Taiga.io or self-hosted Taiga API instance.
 
-Before every Rust or Cargo command:
-
 ```sh
+# optional, only if you use vfox:
 vfox use -p rust@1.98.0
 ```
 
 ## Build and test
 
 ```sh
-vfox use -p rust@1.98.0
 cargo test --workspace --all-targets --all-features --locked
 cargo build --release --package taiga-cli
 ```
