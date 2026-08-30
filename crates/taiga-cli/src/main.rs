@@ -11,7 +11,8 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use taiga_client::{
-    LoginRequest, NotificationId, PaginationMode, ProjectId, TaigaClient, TaigaError,
+    LoginRequest, NotificationId, PaginationMode, ProjectId, RefreshRequest, TaigaClient,
+    TaigaError, TokenPair,
 };
 use thiserror::Error;
 
@@ -337,12 +338,9 @@ fn api_url(cli_url: &Option<String>, config: &Config) -> String {
         .or_else(|| config.api_url.clone())
         .unwrap_or_else(|| "https://api.taiga.io/api/v1".into())
 }
-fn client(url: String, config: &Config) -> Result<TaigaClient, AppError> {
-    let token = std::env::var("TAIGA_AUTH_TOKEN")
-        .ok()
-        .or_else(|| config.auth_token.clone());
-    let builder = TaigaClient::builder(&url)?;
-    Ok(match token {
+fn client(url: &str, access_token: Option<&str>) -> Result<TaigaClient, AppError> {
+    let builder = TaigaClient::builder(url)?;
+    Ok(match access_token {
         Some(token) => builder.bearer_token(SecretString::from(token)).build()?,
         None => builder.build()?,
     })
@@ -423,7 +421,7 @@ fn emit(output: Output, value: &impl Serialize) -> Result<(), AppError> {
 async fn resource(
     client: &TaigaClient,
     path: &str,
-    action: ResourceAction,
+    action: &ResourceAction,
     output: Output,
 ) -> Result<(), AppError> {
     let service = match path {
@@ -438,7 +436,7 @@ async fn resource(
     };
     match action {
         ResourceAction::List(args) => {
-            let mut list_query = query(&args);
+            let mut list_query = query(args);
             if path == "projects" && !args.all_visible {
                 let me: Value = client.get_path("users/me", &[]).await?;
                 let member = me
@@ -462,7 +460,7 @@ async fn resource(
                 .await?,
         ),
         ResourceAction::Create(args) => {
-            emit(output, &service.create::<Value, _>(&body(&args)?).await?)
+            emit(output, &service.create::<Value, _>(&body(args)?).await?)
         }
         ResourceAction::Edit(args) => {
             let current = service.get::<Value>(args.id).await?;
@@ -473,7 +471,7 @@ async fn resource(
             emit(
                 output,
                 &service
-                    .patch::<Value, _>(args.id, &edit_body(&args, version)?)
+                    .patch::<Value, _>(args.id, &edit_body(args, version)?)
                     .await?,
             )
         }
@@ -603,214 +601,277 @@ async fn resource(
     }
 }
 
+fn set_tokens(config: &mut Config, tokens: &TokenPair) {
+    config.auth_token = Some(tokens.auth_token.expose_secret().to_owned());
+    config.refresh_token = Some(tokens.refresh.expose_secret().to_owned());
+}
+
+async fn execute_authenticated(
+    client: &TaigaClient,
+    config: &Config,
+    command: &Command,
+    output: Output,
+) -> Result<(), AppError> {
+    match command {
+        Command::Auth(AuthCommand {
+            action: AuthAction::Status,
+        }) => {
+            let identity: Value = client.get_path("users/me", &[]).await?;
+            emit(
+                output,
+                &json!({"api_url":config.api_url,"identity":identity}),
+            )
+        }
+        Command::Project(c) => resource(client, "projects", &c.action, output).await,
+        Command::Userstory(c) => resource(client, "userstories", &c.action, output).await,
+        Command::Issue(c) => resource(client, "issues", &c.action, output).await,
+        Command::Milestone(c) => resource(client, "milestones", &c.action, output).await,
+        Command::Wiki(c) => resource(client, "wiki", &c.action, output).await,
+        Command::Task(c) => match &c.action {
+            TaskAction::Resource(action) => resource(client, "tasks", action, output).await,
+            TaskAction::Status(args) => {
+                let current = client.tasks().get::<Value>(args.id).await?;
+                let version = current
+                    .get("version")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| AppError::Usage("task response lacks version".into()))?;
+                emit(
+                    output,
+                    &client
+                        .tasks()
+                        .patch::<Value, _>(
+                            args.id,
+                            &json!({"status":args.status,"version":version}),
+                        )
+                        .await?,
+                )
+            }
+        },
+        Command::Epic(c) => match &c.action {
+            EpicAction::Resource(action) => resource(client, "epics", action, output).await,
+            EpicAction::Stories(stories) => match &stories.action {
+                EpicStoriesAction::List(args) => emit(
+                    output,
+                    &client
+                        .list_path::<Value>(
+                            &format!("epics/{}/related_userstories", args.id),
+                            &[],
+                            PaginationMode::All,
+                        )
+                        .await?,
+                ),
+                EpicStoriesAction::Add(args) => emit(
+                    output,
+                    &client
+                        .post_path::<Value, _>(
+                            &format!("epics/{}/related_userstories", args.epic_id),
+                            &json!({"epic":args.epic_id,"user_story":args.story_id}),
+                        )
+                        .await?,
+                ),
+                EpicStoriesAction::Reorder(args) => emit(
+                    output,
+                    &client
+                        .patch_path::<Value, _>(
+                            &format!(
+                                "epics/{}/related_userstories/{}",
+                                args.epic_id, args.story_id
+                            ),
+                            &json!({"order":args.order}),
+                        )
+                        .await?,
+                ),
+                EpicStoriesAction::Remove(args) => {
+                    if !args.yes {
+                        return Err(AppError::Usage("remove requires --yes".into()));
+                    }
+                    client
+                        .delete_path(&format!(
+                            "epics/{}/related_userstories/{}",
+                            args.epic_id, args.story_id
+                        ))
+                        .await?;
+                    emit(output, &json!({"deleted":true,"story_id":args.story_id}))
+                }
+            },
+        },
+        Command::Search(search) => {
+            if search.text.trim().is_empty() {
+                return Err(AppError::Usage("search text cannot be blank".into()));
+            }
+            if search.all_projects {
+                let projects = client
+                    .projects()
+                    .list::<Value>(&[], PaginationMode::All)
+                    .await?;
+                let mut rows = Vec::new();
+                for project in projects.items {
+                    let id = project
+                        .get("id")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| AppError::Usage("project list entry lacks id".into()))?;
+                    rows.push(json!({"project":project,"results":client.search().project(ProjectId(id), &search.text).await?}));
+                }
+                return emit(output, &json!({"projects":rows}));
+            }
+            let project = if let Some(id) = search.project {
+                ProjectId(id)
+            } else if let Some(slug) = &search.project_slug {
+                let project: Value = client
+                    .get_path("projects/by_slug", &[("slug".into(), slug.clone())])
+                    .await?;
+                ProjectId(
+                    project
+                        .get("id")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| AppError::Usage("project lookup lacks id".into()))?,
+                )
+            } else {
+                return Err(AppError::Usage(
+                    "select --project, --project-slug, or --all-projects".into(),
+                ));
+            };
+            emit(
+                output,
+                &client.search().project(project, &search.text).await?,
+            )
+        }
+        Command::Notification(notification) => match &notification.action {
+            NotificationAction::List { unread, page } => emit(
+                output,
+                &client
+                    .notifications()
+                    .list(*unread, pagination(*page)?)
+                    .await?,
+            ),
+            NotificationAction::Count => emit(
+                output,
+                &json!({"count":client.notifications().unread_count().await?}),
+            ),
+            NotificationAction::Read(args) => {
+                client.notifications().read(NotificationId(args.id)).await?;
+                emit(output, &json!({"read":true,"id":args.id}))
+            }
+            NotificationAction::ReadAll => {
+                client.notifications().read_all().await?;
+                emit(output, &json!({"read_all":true}))
+            }
+        },
+        Command::Timeline(timeline) => {
+            let (kind, args) = match &timeline.action {
+                TimelineAction::User(args) => ("user", args),
+                TimelineAction::Profile(args) => ("profile", args),
+                TimelineAction::Project(args) => ("project", args),
+            };
+            emit(
+                output,
+                &client
+                    .timeline()
+                    .list::<Value>(kind, args.id, args.relevant, pagination(args.page)?)
+                    .await?,
+            )
+        }
+        Command::Auth(_) => unreachable!(),
+    }
+}
+
+async fn run_authenticated(
+    path: &PathBuf,
+    url: &str,
+    config: &mut Config,
+    allow_stored_refresh: bool,
+    command: &Command,
+    output: Output,
+) -> Result<(), AppError> {
+    let environment_access = std::env::var("TAIGA_AUTH_TOKEN").ok();
+    let access_from_environment = environment_access.is_some();
+    let access_token = environment_access.or_else(|| config.auth_token.clone());
+    let initial = client(url, access_token.as_deref())?;
+    let unauthorized = match execute_authenticated(&initial, config, command, output).await {
+        Ok(()) => return Ok(()),
+        Err(error @ AppError::Client(TaigaError::Unauthorized { .. })) => error,
+        Err(error) => return Err(error),
+    };
+
+    let (refresh_token, persist_rotation) =
+        if let Ok(refresh) = std::env::var("TAIGA_REFRESH_TOKEN") {
+            (refresh, false)
+        } else if access_from_environment || !allow_stored_refresh {
+            return Err(unauthorized);
+        } else if let Some(refresh) = config.refresh_token.clone() {
+            (refresh, true)
+        } else {
+            return Err(unauthorized);
+        };
+    let tokens = initial
+        .auth()
+        .refresh(&RefreshRequest {
+            refresh: SecretString::from(refresh_token),
+        })
+        .await?;
+    if persist_rotation {
+        set_tokens(config, &tokens);
+        save_config(path, config)?;
+    }
+    let retry = client(url, Some(tokens.auth_token.expose_secret()))?;
+    execute_authenticated(&retry, config, command, output).await
+}
+
 async fn run(cli: Cli) -> Result<(), AppError> {
     let path = config_path()?;
     let mut config = load_config(&path)?;
+    let api_overridden = cli.api_url.is_some() || std::env::var_os("TAIGA_API_URL").is_some();
     let url = api_url(&cli.api_url, &config);
-    match cli.command {
-        Command::Auth(command) => match command.action {
-            AuthAction::Login(args) => {
-                let username = args.username.ok_or_else(|| {
-                    AppError::Config("username required via --username or TAIGA_USERNAME".into())
-                })?;
-                let password = if args.password_stdin {
-                    let mut text = String::new();
-                    io::stdin().read_to_string(&mut text)?;
-                    text.trim_end().to_owned()
-                } else if let Ok(password) = std::env::var("TAIGA_PASSWORD") {
-                    password
-                } else {
-                    rpassword::prompt_password("Taiga password: ")?
-                };
-                let anonymous = TaigaClient::builder(&url)?.build()?;
-                let session = anonymous
-                    .auth()
-                    .login(&LoginRequest {
-                        username,
-                        password: SecretString::from(password),
-                    })
-                    .await?;
-                config.api_url = Some(url);
-                config.auth_token = Some(session.tokens.auth_token.expose_secret().to_owned());
-                config.refresh_token = Some(session.tokens.refresh.expose_secret().to_owned());
-                save_config(&path, &config)?;
-                emit(
-                    cli.output,
-                    &json!({"id":session.id,"username":session.username,"api_url":config.api_url}),
-                )
-            }
-            AuthAction::Status => {
-                let identity: Value = client(url, &config)?.get_path("users/me", &[]).await?;
-                emit(
-                    cli.output,
-                    &json!({"api_url":config.api_url,"identity":identity}),
-                )
-            }
-            AuthAction::Logout => {
-                config.auth_token = None;
-                config.refresh_token = None;
-                save_config(&path, &config)?;
-                emit(cli.output, &json!({"logged_out":true}))
-            }
-        },
-        command => {
-            let client = client(url, &config)?;
-            match command {
-                Command::Project(c) => resource(&client, "projects", c.action, cli.output).await,
-                Command::Userstory(c) => {
-                    resource(&client, "userstories", c.action, cli.output).await
-                }
-                Command::Issue(c) => resource(&client, "issues", c.action, cli.output).await,
-                Command::Milestone(c) => {
-                    resource(&client, "milestones", c.action, cli.output).await
-                }
-                Command::Wiki(c) => resource(&client, "wiki", c.action, cli.output).await,
-                Command::Task(c) => match c.action {
-                    TaskAction::Resource(a) => resource(&client, "tasks", a, cli.output).await,
-                    TaskAction::Status(a) => {
-                        let current = client.tasks().get::<Value>(a.id).await?;
-                        let version = current
-                            .get("version")
-                            .and_then(Value::as_u64)
-                            .ok_or_else(|| AppError::Usage("task response lacks version".into()))?;
-                        emit(
-                            cli.output,
-                            &client
-                                .tasks()
-                                .patch::<Value, _>(
-                                    a.id,
-                                    &json!({"status":a.status,"version":version}),
-                                )
-                                .await?,
-                        )
-                    }
-                },
-                Command::Epic(c) => match c.action {
-                    EpicAction::Resource(a) => resource(&client, "epics", a, cli.output).await,
-                    EpicAction::Stories(stories) => match stories.action {
-                        EpicStoriesAction::List(a) => emit(
-                            cli.output,
-                            &client
-                                .list_path::<Value>(
-                                    &format!("epics/{}/related_userstories", a.id),
-                                    &[],
-                                    PaginationMode::All,
-                                )
-                                .await?,
-                        ),
-                        EpicStoriesAction::Add(a) => emit(
-                            cli.output,
-                            &client
-                                .post_path::<Value, _>(
-                                    &format!("epics/{}/related_userstories", a.epic_id),
-                                    &json!({"epic":a.epic_id,"user_story":a.story_id}),
-                                )
-                                .await?,
-                        ),
-                        EpicStoriesAction::Reorder(a) => emit(
-                            cli.output,
-                            &client
-                                .patch_path::<Value, _>(
-                                    &format!(
-                                        "epics/{}/related_userstories/{}",
-                                        a.epic_id, a.story_id
-                                    ),
-                                    &json!({"order":a.order}),
-                                )
-                                .await?,
-                        ),
-                        EpicStoriesAction::Remove(a) => {
-                            if !a.yes {
-                                return Err(AppError::Usage("remove requires --yes".into()));
-                            }
-                            client
-                                .delete_path(&format!(
-                                    "epics/{}/related_userstories/{}",
-                                    a.epic_id, a.story_id
-                                ))
-                                .await?;
-                            emit(cli.output, &json!({"deleted":true,"story_id":a.story_id}))
-                        }
-                    },
-                },
-                Command::Search(s) => {
-                    if s.text.trim().is_empty() {
-                        return Err(AppError::Usage("search text cannot be blank".into()));
-                    }
-                    if s.all_projects {
-                        let projects = client
-                            .projects()
-                            .list::<Value>(&[], PaginationMode::All)
-                            .await?;
-                        let mut rows = Vec::new();
-                        for project in projects.items {
-                            let id =
-                                project.get("id").and_then(Value::as_u64).ok_or_else(|| {
-                                    AppError::Usage("project list entry lacks id".into())
-                                })?;
-                            rows.push(json!({"project":project,"results":client.search().project(ProjectId(id), &s.text).await?}));
-                        }
-                        return emit(cli.output, &json!({"projects":rows}));
-                    }
-                    let project = if let Some(id) = s.project {
-                        ProjectId(id)
-                    } else if let Some(slug) = s.project_slug {
-                        let project: Value = client
-                            .get_path("projects/by_slug", &[("slug".into(), slug)])
-                            .await?;
-                        ProjectId(
-                            project
-                                .get("id")
-                                .and_then(Value::as_u64)
-                                .ok_or_else(|| AppError::Usage("project lookup lacks id".into()))?,
-                        )
-                    } else {
-                        return Err(AppError::Usage(
-                            "select --project, --project-slug, or --all-projects".into(),
-                        ));
-                    };
-                    emit(
-                        cli.output,
-                        &client.search().project(project, &s.text).await?,
-                    )
-                }
-                Command::Notification(n) => match n.action {
-                    NotificationAction::List { unread, page } => emit(
-                        cli.output,
-                        &client
-                            .notifications()
-                            .list(unread, pagination(page)?)
-                            .await?,
-                    ),
-                    NotificationAction::Count => emit(
-                        cli.output,
-                        &json!({"count":client.notifications().unread_count().await?}),
-                    ),
-                    NotificationAction::Read(a) => {
-                        client.notifications().read(NotificationId(a.id)).await?;
-                        emit(cli.output, &json!({"read":true,"id":a.id}))
-                    }
-                    NotificationAction::ReadAll => {
-                        client.notifications().read_all().await?;
-                        emit(cli.output, &json!({"read_all":true}))
-                    }
-                },
-                Command::Timeline(t) => {
-                    let (kind, args) = match t.action {
-                        TimelineAction::User(a) => ("user", a),
-                        TimelineAction::Profile(a) => ("profile", a),
-                        TimelineAction::Project(a) => ("project", a),
-                    };
-                    emit(
-                        cli.output,
-                        &client
-                            .timeline()
-                            .list::<Value>(kind, args.id, args.relevant, pagination(args.page)?)
-                            .await?,
-                    )
-                }
-                Command::Auth(_) => unreachable!(),
-            }
+    match &cli.command {
+        Command::Auth(AuthCommand {
+            action: AuthAction::Login(args),
+        }) => {
+            let username = args.username.clone().ok_or_else(|| {
+                AppError::Config("username required via --username or TAIGA_USERNAME".into())
+            })?;
+            let password = if args.password_stdin {
+                let mut text = String::new();
+                io::stdin().read_to_string(&mut text)?;
+                text.trim_end().to_owned()
+            } else if let Ok(password) = std::env::var("TAIGA_PASSWORD") {
+                password
+            } else {
+                rpassword::prompt_password("Taiga password: ")?
+            };
+            let anonymous = client(&url, None)?;
+            let session = anonymous
+                .auth()
+                .login(&LoginRequest {
+                    username,
+                    password: SecretString::from(password),
+                })
+                .await?;
+            config.api_url = Some(url);
+            set_tokens(&mut config, &session.tokens);
+            save_config(&path, &config)?;
+            emit(
+                cli.output,
+                &json!({"id":session.id,"username":session.username,"api_url":config.api_url}),
+            )
+        }
+        Command::Auth(AuthCommand {
+            action: AuthAction::Logout,
+        }) => {
+            config.auth_token = None;
+            config.refresh_token = None;
+            save_config(&path, &config)?;
+            emit(cli.output, &json!({"logged_out":true}))
+        }
+        _ => {
+            run_authenticated(
+                &path,
+                &url,
+                &mut config,
+                !api_overridden,
+                &cli.command,
+                cli.output,
+            )
+            .await
         }
     }
 }

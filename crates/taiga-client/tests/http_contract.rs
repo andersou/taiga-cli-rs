@@ -1,5 +1,7 @@
-use secrecy::SecretString;
-use taiga_client::{LoginRequest, PaginationMode, TaigaClient, TaigaError, TaigaObject};
+use secrecy::{ExposeSecret, SecretString};
+use taiga_client::{
+    LoginRequest, PaginationMode, RefreshRequest, TaigaClient, TaigaError, TaigaObject,
+};
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{body_json, header, method, path, query_param},
@@ -55,6 +57,34 @@ async fn login_omits_bearer_and_returns_rotated_tokens() {
         .await
         .unwrap();
     assert_eq!(session.id.unwrap().0, 1);
+}
+
+#[tokio::test]
+async fn refresh_posts_refresh_token_and_returns_rotated_tokens() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/auth/refresh"))
+        .and(body_json(serde_json::json!({"refresh":"old-refresh"})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"auth_token":"new-access","refresh":"new-refresh"}),
+            ),
+        )
+        .mount(&server)
+        .await;
+    let client = TaigaClient::builder(&server.uri())
+        .unwrap()
+        .build()
+        .unwrap();
+    let tokens = client
+        .auth()
+        .refresh(&RefreshRequest {
+            refresh: SecretString::from("old-refresh"),
+        })
+        .await
+        .unwrap();
+    assert_eq!(tokens.auth_token.expose_secret(), "new-access");
+    assert_eq!(tokens.refresh.expose_secret(), "new-refresh");
 }
 
 #[tokio::test]
