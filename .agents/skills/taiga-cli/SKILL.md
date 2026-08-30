@@ -9,14 +9,15 @@ Rust CLI for the Taiga REST API. Output is pretty-printed JSON; pass `--output j
 
 ## Binary
 
-If `taiga` is not on PATH, build it from this repository:
+If `taiga` is not on PATH, do not build anything on your own — tell the user to download a precompiled archive from the GitHub releases page (https://github.com/andersou/taiga-cli-rs/releases) for their platform (Linux x86_64, Windows x86_64, Intel macOS, or Apple Silicon macOS) and place the extracted `taiga` binary on PATH.
+
+Only if the user prefers building from source, any Rust 1.98.0+ toolchain works — rustup, vfox (the repo ships a `.vfox.toml`), or another manager:
 
 ```sh
-vfox use -p rust@1.98.0
 cargo build --release --package taiga-cli
 ```
 
-Binary: `target/release/taiga`. Prebuilt archives: GitHub releases of `andersou/taiga-cli-rs`.
+Binary: `target/release/taiga`.
 
 ## Server and authentication
 
