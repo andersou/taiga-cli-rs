@@ -19,6 +19,8 @@ cargo build --release --package taiga-cli
 
 Binary: `target/release/taiga-cli`.
 
+If `taiga-cli` is on PATH but older than the latest release, `taiga-cli self-update --check` says so and `taiga-cli self-update` replaces the binary with the verified release archive; no login is needed.
+
 ## Server and authentication
 
 - Default server `https://api.taiga.io/api/v1`. Self-hosted: `--api-url` or `TAIGA_API_URL` (host, `/api`, or `/api/v1` forms all accepted).

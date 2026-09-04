@@ -4,6 +4,7 @@ version = "1.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+build = "build.rs"
 
 [[bin]]
 name = "taiga-cli"
@@ -13,15 +14,22 @@ path = "src/main.rs"
 chrono.workspace = true
 clap.workspace = true
 directories.workspace = true
+flate2.workspace = true
+reqwest.workspace = true
 rpassword.workspace = true
+self-replace.workspace = true
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+tar.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 secrecy.workspace = true
 taiga-client = { path = "../taiga-client" }
 keyring.workspace = true
+zip.workspace = true
 
 [dev-dependencies]
 assert_cmd = "2.0"
