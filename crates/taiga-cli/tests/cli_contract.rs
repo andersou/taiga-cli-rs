@@ -23,12 +23,23 @@ fn help_exposes_requested_command_groups() {
 
 #[test]
 fn delete_requires_explicit_confirmation_before_network() {
-    let mut command = Command::cargo_bin("taiga-cli").unwrap();
-    command
-        .args(["project", "delete", "1"])
+    let directory = tempdir().unwrap();
+    taiga(
+        &directory.path().join("missing.json"),
+        &["project", "delete", "1"],
+    )
+    .assert()
+    .code(2)
+    .stderr(contains("delete requires --yes"));
+}
+
+#[test]
+fn missing_session_reports_login_hint_without_network() {
+    let directory = tempdir().unwrap();
+    taiga(&directory.path().join("missing.json"), &["project", "list"])
         .assert()
-        .code(2)
-        .stderr(contains("delete requires --yes"));
+        .code(5)
+        .stderr(contains("no valid session, run `taiga-cli auth login`"));
 }
 
 fn write_config(path: &std::path::Path, api_url: &str, auth_token: &str, refresh_token: &str) {

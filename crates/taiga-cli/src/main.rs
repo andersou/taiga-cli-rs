@@ -903,12 +903,19 @@ async fn run_authenticated(
     let mut last_error = None;
 
     // Stage 1: the current access token, unless its JWT `exp` already passed.
-    if let Some(token) = access_token.as_deref().filter(|t| !session::is_expired(t)) {
-        let initial = client(url, Some(token))?;
+    // With no token at all the command still runs so argument validation
+    // fails before any network access, as it always did.
+    let access_usable = access_token
+        .as_deref()
+        .is_none_or(|token| !session::is_expired(token));
+    if access_usable {
+        let initial = client(url, access_token.as_deref())?;
         match execute_authenticated(&initial, config, command, output).await {
             Ok(()) => return Ok(()),
             Err(error @ AppError::Client(TaigaError::Unauthorized { .. })) => {
-                last_error = Some(error);
+                if access_token.is_some() {
+                    last_error = Some(error);
+                }
             }
             Err(error) => return Err(error),
         }
