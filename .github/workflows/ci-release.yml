@@ -156,11 +156,11 @@ jobs:
           set -euo pipefail
           cargo test --workspace --all-targets --all-features --locked --target "${{ matrix.target }}"
           cargo build --release --locked --target "${{ matrix.target }}" --package taiga-cli
-          binary="taiga${{ matrix.extension }}"
+          binary="taiga-cli${{ matrix.extension }}"
           binary_path="target/${{ matrix.target }}/release/${binary}"
           test -f "$binary_path"
-          test "$("$binary_path" --version)" = "taiga $VERSION"
-          archive="taiga-${VERSION}-${{ matrix.target }}.${{ matrix.archive }}"
+          test "$("$binary_path" --version)" = "taiga-cli $VERSION"
+          archive="taiga-cli-${VERSION}-${{ matrix.target }}.${{ matrix.archive }}"
           mkdir -p dist
           if [ "${{ matrix.archive }}" = zip ]; then
             archive_path="$(pwd)/dist/$archive"
