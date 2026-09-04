@@ -16,6 +16,21 @@ Download a precompiled archive from the [GitHub releases](https://github.com/and
 
 To build from source instead, see the sections below.
 
+### Agent skill
+
+Install the global skill from a local clone:
+
+```sh
+npx skills add /path/to/taiga-cli-rs --global --skill taiga-cli --yes
+```
+
+Or install directly from GitHub:
+
+```sh
+npx skills add https://github.com/andersou/taiga-cli-rs --global --skill taiga-cli --yes
+```
+
+
 ## Requirements
 
 - Rust 1.98.0 or newer. Install it however you prefer: [rustup](https://rustup.rs/) or any other toolchain manager works. If you use [vfox](https://vfox.lhan.me/), the repository ships a `.vfox.toml` and the command below selects the pinned toolchain — but vfox is only a suggestion, not a requirement.
