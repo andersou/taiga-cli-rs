@@ -16,6 +16,15 @@ Download a precompiled archive from the [GitHub releases](https://github.com/and
 
 To build from source instead, see the sections below.
 
+### Agent skill
+
+From a local checkout, install the global skill for supported coding agents:
+
+```sh
+npx skills add . --global --skill taiga-cli --yes
+```
+
+
 ## Requirements
 
 - Rust 1.98.0 or newer. Install it however you prefer: [rustup](https://rustup.rs/) or any other toolchain manager works. If you use [vfox](https://vfox.lhan.me/), the repository ships a `.vfox.toml` and the command below selects the pinned toolchain — but vfox is only a suggestion, not a requirement.
