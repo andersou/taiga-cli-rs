@@ -19,7 +19,7 @@ cargo build --release --package taiga-cli
 
 Binary: `target/release/taiga-cli`.
 
-If `taiga-cli` is on PATH but older than the latest release, `taiga-cli self-update --check` says so and `taiga-cli self-update` replaces the binary with the verified release archive; no login is needed.
+If `taiga-cli` is on PATH but older than the latest release, `taiga-cli update --check` says so and `taiga-cli update` replaces the binary with the verified release archive; no login is needed.
 
 ## Server and authentication
 

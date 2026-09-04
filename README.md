@@ -17,8 +17,8 @@ Download a precompiled archive from the [GitHub releases](https://github.com/and
 Later, let the binary update itself from the latest release (the archive for your platform is verified against the release's `SHA256SUMS` before it replaces the current executable; no login needed, an optional `GITHUB_TOKEN` raises GitHub's API rate limit):
 
 ```sh
-taiga-cli self-update --check    # only report whether a newer release exists
-taiga-cli self-update            # download, verify, and replace the running binary
+taiga-cli update --check    # only report whether a newer release exists
+taiga-cli update            # download, verify, and replace the running binary
 ```
 
 To build from source instead, see the sections below.

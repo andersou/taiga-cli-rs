@@ -50,10 +50,11 @@ enum Command {
     Notification(NotificationCommand),
     Timeline(TimelineCommand),
     /// Replace this binary with the latest GitHub release
-    SelfUpdate(SelfUpdateArgs),
+    #[command(alias = "self-update")]
+    Update(UpdateArgs),
 }
 #[derive(Args)]
-struct SelfUpdateArgs {
+struct UpdateArgs {
     /// Only report whether a newer release exists
     #[arg(long)]
     check: bool,
@@ -813,7 +814,7 @@ async fn execute_authenticated(
                     .await?,
             )
         }
-        Command::Auth(_) | Command::SelfUpdate(_) => unreachable!(),
+        Command::Auth(_) | Command::Update(_) => unreachable!(),
     }
 }
 
@@ -1009,7 +1010,7 @@ fn forget_password(store: &PasswordStore, config: &Config) -> Result<(), AppErro
         .map_err(|error| AppError::Config(format!("unable to remove saved password: {error}")))
 }
 
-async fn self_update(output: Output, args: &SelfUpdateArgs) -> Result<(), AppError> {
+async fn update_binary(output: Output, args: &UpdateArgs) -> Result<(), AppError> {
     let current = semver::Version::parse(update::CURRENT_VERSION)
         .map_err(|e| AppError::Config(format!("invalid build version: {e}")))?;
     let http = update::http_client()?;
@@ -1068,8 +1069,8 @@ async fn self_update(output: Output, args: &SelfUpdateArgs) -> Result<(), AppErr
 }
 
 async fn run(cli: Cli) -> Result<(), AppError> {
-    if let Command::SelfUpdate(args) = &cli.command {
-        return self_update(cli.output, args).await;
+    if let Command::Update(args) = &cli.command {
+        return update_binary(cli.output, args).await;
     }
     let path = config_path()?;
     let mut config = load_config(&path)?;
