@@ -1,7 +1,9 @@
+mod session;
+
 use std::{
     collections::BTreeMap,
     fs,
-    io::{self, Read},
+    io::{self, IsTerminal, Read},
     path::PathBuf,
 };
 
@@ -16,8 +18,10 @@ use taiga_client::{
 };
 use thiserror::Error;
 
+use crate::session::PasswordStore;
+
 #[derive(Parser)]
-#[command(name = "taiga", version, about = "Taiga REST API CLI")]
+#[command(name = "taiga-cli", version, about = "Taiga REST API CLI")]
 struct Cli {
     #[arg(long, global = true, value_enum, default_value_t = Output::Human)]
     output: Output,
@@ -50,6 +54,8 @@ enum AuthAction {
     Login(LoginArgs),
     Status,
     Logout,
+    /// Remove the password saved by `login --remember`, keeping the session
+    Forget,
 }
 #[derive(Args)]
 struct AuthCommand {
@@ -62,6 +68,9 @@ struct LoginArgs {
     username: Option<String>,
     #[arg(long)]
     password_stdin: bool,
+    /// Save the password in the system keychain for silent re-login
+    #[arg(long)]
+    remember: bool,
 }
 #[derive(Args)]
 struct ResourceCommand {
@@ -93,12 +102,17 @@ struct ListArgs {
     page: Option<u32>,
     #[arg(long)]
     all_visible: bool,
+    /// Filter by closed state (milestones use the API `closed` flag,
+    /// everything else uses `status__is_closed`)
     #[arg(long)]
     closed: Option<bool>,
     #[arg(long)]
     status: Option<u64>,
     #[arg(long)]
     assigned_to: Option<u64>,
+    /// Restrict stories, tasks, or issues to one sprint (milestone ID)
+    #[arg(long)]
+    milestone: Option<u64>,
     #[arg(long)]
     tag: Vec<String>,
 }
@@ -287,6 +301,10 @@ struct Config {
     api_url: Option<String>,
     auth_token: Option<String>,
     refresh_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    remember_password: bool,
 }
 
 fn config_path() -> Result<PathBuf, AppError> {
@@ -345,19 +363,25 @@ fn client(url: &str, access_token: Option<&str>) -> Result<TaigaClient, AppError
         None => builder.build()?,
     })
 }
-fn query(args: &ListArgs) -> Vec<(String, String)> {
+fn query(path: &str, args: &ListArgs) -> Vec<(String, String)> {
     let mut q = Vec::new();
     for (key, value) in [
         ("project", args.project),
         ("status", args.status),
         ("assigned_to", args.assigned_to),
+        ("milestone", args.milestone),
     ] {
         if let Some(v) = value {
             q.push((key.into(), v.to_string()));
         }
     }
     if let Some(closed) = args.closed {
-        q.push(("status__is_closed".into(), closed.to_string()));
+        let key = if path == "milestones" {
+            "closed"
+        } else {
+            "status__is_closed"
+        };
+        q.push((key.into(), closed.to_string()));
     }
     if !args.tag.is_empty() {
         q.push(("tags".into(), args.tag.join(",")));
@@ -436,7 +460,7 @@ async fn resource(
     };
     match action {
         ResourceAction::List(args) => {
-            let mut list_query = query(args);
+            let mut list_query = query(path, args);
             if path == "projects" && !args.all_visible {
                 let me: Value = client.get_path("users/me", &[]).await?;
                 let member = me
@@ -619,7 +643,11 @@ async fn execute_authenticated(
             let identity: Value = client.get_path("users/me", &[]).await?;
             emit(
                 output,
-                &json!({"api_url":config.api_url,"identity":identity}),
+                &json!({
+                    "api_url": config.api_url,
+                    "identity": identity,
+                    "password_stored": config.remember_password,
+                }),
             )
         }
         Command::Project(c) => resource(client, "projects", &c.action, output).await,
@@ -775,46 +803,189 @@ async fn execute_authenticated(
     }
 }
 
+/// Credentials usable for a silent re-login once both tokens are gone.
+struct ReloginCredentials {
+    username: String,
+    password: SecretString,
+    /// Whether the resulting tokens belong in the config file.
+    persist: bool,
+}
+
+fn session_expired() -> AppError {
+    AppError::Client(TaigaError::Unauthorized {
+        message: "no valid session, run `taiga-cli auth login`".into(),
+    })
+}
+
+async fn password_from_store(
+    store: &PasswordStore,
+    url: &str,
+    username: &str,
+) -> Option<SecretString> {
+    let store = store.clone();
+    let (url, username) = (url.to_owned(), username.to_owned());
+    let lookup = tokio::task::spawn_blocking(move || store.get(&url, &username)).await;
+    match lookup {
+        Ok(Ok(password)) => password,
+        Ok(Err(error)) => {
+            eprintln!("warning: {error}");
+            None
+        }
+        Err(error) => {
+            eprintln!("warning: password lookup failed: {error}");
+            None
+        }
+    }
+}
+
+/// Resolves credentials for re-login in priority order: `TAIGA_PASSWORD`
+/// from the environment, the password saved with `login --remember`, and
+/// finally an interactive prompt when stdin is a terminal.
+async fn relogin_credentials(
+    config: &Config,
+    url: &str,
+    access_from_environment: bool,
+    allow_stored: bool,
+) -> Option<ReloginCredentials> {
+    let username = std::env::var("TAIGA_USERNAME")
+        .ok()
+        .or_else(|| config.username.clone())?;
+    if let Ok(password) = std::env::var("TAIGA_PASSWORD") {
+        return Some(ReloginCredentials {
+            username,
+            password: SecretString::from(password),
+            persist: false,
+        });
+    }
+    if access_from_environment || !allow_stored {
+        return None;
+    }
+    if config.remember_password
+        && let Some(password) =
+            password_from_store(&PasswordStore::from_environment(), url, &username).await
+    {
+        return Some(ReloginCredentials {
+            username,
+            password,
+            persist: true,
+        });
+    }
+    if io::stdin().is_terminal() {
+        let prompt = format!("Session expired. Taiga password for {username}: ");
+        let password = rpassword::prompt_password(prompt).ok()?;
+        return Some(ReloginCredentials {
+            username,
+            password: SecretString::from(password),
+            persist: true,
+        });
+    }
+    None
+}
+
 async fn run_authenticated(
     path: &PathBuf,
     url: &str,
     config: &mut Config,
-    allow_stored_refresh: bool,
+    allow_stored: bool,
     command: &Command,
     output: Output,
 ) -> Result<(), AppError> {
     let environment_access = std::env::var("TAIGA_AUTH_TOKEN").ok();
     let access_from_environment = environment_access.is_some();
     let access_token = environment_access.or_else(|| config.auth_token.clone());
-    let initial = client(url, access_token.as_deref())?;
-    let unauthorized = match execute_authenticated(&initial, config, command, output).await {
-        Ok(()) => return Ok(()),
-        Err(error @ AppError::Client(TaigaError::Unauthorized { .. })) => error,
-        Err(error) => return Err(error),
+    let refresh_source = if let Ok(refresh) = std::env::var("TAIGA_REFRESH_TOKEN") {
+        Some((refresh, false))
+    } else if access_from_environment || !allow_stored {
+        None
+    } else {
+        config.refresh_token.clone().map(|refresh| (refresh, true))
     };
+    let mut last_error = None;
 
-    let (refresh_token, persist_rotation) =
-        if let Ok(refresh) = std::env::var("TAIGA_REFRESH_TOKEN") {
-            (refresh, false)
-        } else if access_from_environment || !allow_stored_refresh {
-            return Err(unauthorized);
-        } else if let Some(refresh) = config.refresh_token.clone() {
-            (refresh, true)
-        } else {
-            return Err(unauthorized);
-        };
-    let tokens = initial
+    // Stage 1: the current access token, unless its JWT `exp` already passed.
+    if let Some(token) = access_token.as_deref().filter(|t| !session::is_expired(t)) {
+        let initial = client(url, Some(token))?;
+        match execute_authenticated(&initial, config, command, output).await {
+            Ok(()) => return Ok(()),
+            Err(error @ AppError::Client(TaigaError::Unauthorized { .. })) => {
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    // Stage 2: rotate through the refresh token, unless it is also expired.
+    if let Some((refresh, persist)) =
+        refresh_source.filter(|(refresh, _)| !session::is_expired(refresh))
+    {
+        let anonymous = client(url, None)?;
+        match anonymous
+            .auth()
+            .refresh(&RefreshRequest {
+                refresh: SecretString::from(refresh),
+            })
+            .await
+        {
+            Ok(tokens) => {
+                if persist {
+                    set_tokens(config, &tokens);
+                    save_config(path, config)?;
+                }
+                let retry = client(url, Some(tokens.auth_token.expose_secret()))?;
+                return execute_authenticated(&retry, config, command, output).await;
+            }
+            // Taiga answers a stale or revoked refresh token with a 4xx;
+            // anything else (network, 5xx) is not worth a re-login attempt.
+            Err(
+                error @ (TaigaError::Unauthorized { .. }
+                | TaigaError::Forbidden { .. }
+                | TaigaError::ClientResponse { .. }),
+            ) => last_error = Some(error.into()),
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    // Stage 3: a fresh login with stored or prompted credentials.
+    let Some(credentials) =
+        relogin_credentials(config, url, access_from_environment, allow_stored).await
+    else {
+        return Err(last_error.unwrap_or_else(session_expired));
+    };
+    let anonymous = client(url, None)?;
+    let session = anonymous
         .auth()
-        .refresh(&RefreshRequest {
-            refresh: SecretString::from(refresh_token),
+        .login(&LoginRequest {
+            username: credentials.username.clone(),
+            password: credentials.password,
         })
         .await?;
-    if persist_rotation {
-        set_tokens(config, &tokens);
+    if credentials.persist {
+        config.username = Some(credentials.username);
+        set_tokens(config, &session.tokens);
         save_config(path, config)?;
     }
-    let retry = client(url, Some(tokens.auth_token.expose_secret()))?;
+    let retry = client(url, Some(session.tokens.auth_token.expose_secret()))?;
     execute_authenticated(&retry, config, command, output).await
+}
+
+fn store_password(
+    store: &PasswordStore,
+    url: &str,
+    username: &str,
+    password: &SecretString,
+) -> Result<(), AppError> {
+    store
+        .set(url, username, password)
+        .map_err(|error| AppError::Config(format!("unable to save password: {error}")))
+}
+
+fn forget_password(store: &PasswordStore, config: &Config) -> Result<(), AppError> {
+    let (Some(url), Some(username)) = (&config.api_url, &config.username) else {
+        return Ok(());
+    };
+    store
+        .delete(url, username)
+        .map_err(|error| AppError::Config(format!("unable to remove saved password: {error}")))
 }
 
 async fn run(cli: Cli) -> Result<(), AppError> {
@@ -838,29 +1009,71 @@ async fn run(cli: Cli) -> Result<(), AppError> {
             } else {
                 rpassword::prompt_password("Taiga password: ")?
             };
+            let password = SecretString::from(password);
             let anonymous = client(&url, None)?;
             let session = anonymous
                 .auth()
                 .login(&LoginRequest {
-                    username,
-                    password: SecretString::from(password),
+                    username: username.clone(),
+                    password: password.clone(),
                 })
                 .await?;
-            config.api_url = Some(url);
+            let store = PasswordStore::from_environment();
+            let previous_username = config.username.replace(username.clone());
+            if config.remember_password
+                && let Some(previous) = previous_username
+                && (previous != username || config.api_url.as_deref() != Some(url.as_str()))
+            {
+                // The saved entry belongs to another account or server.
+                store
+                    .delete(config.api_url.as_deref().unwrap_or(&url), &previous)
+                    .ok();
+                config.remember_password = false;
+            }
+            config.api_url = Some(url.clone());
             set_tokens(&mut config, &session.tokens);
+            let remember = args.remember || config.remember_password;
+            let stored = if remember {
+                store_password(&store, &url, &username, &password)
+            } else {
+                Ok(())
+            };
+            config.remember_password = remember && stored.is_ok();
             save_config(&path, &config)?;
+            stored?;
             emit(
                 cli.output,
-                &json!({"id":session.id,"username":session.username,"api_url":config.api_url}),
+                &json!({
+                    "id": session.id,
+                    "username": session.username,
+                    "api_url": config.api_url,
+                    "password_stored": config.remember_password,
+                }),
             )
         }
         Command::Auth(AuthCommand {
             action: AuthAction::Logout,
         }) => {
+            let forgotten = if config.remember_password {
+                forget_password(&PasswordStore::from_environment(), &config)
+            } else {
+                Ok(())
+            };
             config.auth_token = None;
             config.refresh_token = None;
+            config.username = None;
+            config.remember_password = false;
             save_config(&path, &config)?;
+            forgotten?;
             emit(cli.output, &json!({"logged_out":true}))
+        }
+        Command::Auth(AuthCommand {
+            action: AuthAction::Forget,
+        }) => {
+            forget_password(&PasswordStore::from_environment(), &config)?;
+            config.remember_password = false;
+            save_config(&path, &config)?;
+            emit(cli.output, &json!({"password_forgotten":true}))
         }
         _ => {
             run_authenticated(
