@@ -606,6 +606,304 @@ async fn milestone_list_uses_closed_filter_and_stories_filter_by_milestone() {
     server.verify().await;
 }
 
+#[tokio::test]
+async fn attachments_add_uploads_multipart_with_project_resolved_from_the_object() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/issues/4242"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"id":4242,"ref":12,"project":7})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/issues/attachments"))
+        .and(header("authorization", "Bearer access"))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(json!({"id":555,"name":"notes.txt","object_id":4242})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let directory = tempdir().unwrap();
+    let config = directory.path().join("config.json");
+    write_config(&config, &server.uri(), "access", "refresh");
+    let file = directory.path().join("notes.txt");
+    fs::write(&file, b"attachment payload").unwrap();
+
+    taiga(
+        &config,
+        &[
+            "issue",
+            "attachments",
+            "add",
+            "4242",
+            file.to_str().unwrap(),
+            "--description",
+            "server log",
+            "--deprecated",
+            "false",
+        ],
+    )
+    .assert()
+    .success()
+    .stdout(contains("\"id\": 555"));
+
+    let upload = upload_request(&server, "/api/v1/issues/attachments").await;
+    let content_type = upload
+        .headers
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        content_type.starts_with("multipart/form-data; boundary="),
+        "unexpected content type: {content_type}"
+    );
+    let body = String::from_utf8(upload.body.clone()).unwrap();
+    for expected in [
+        "name=\"object_id\"",
+        "4242",
+        "name=\"project\"",
+        "name=\"description\"",
+        "server log",
+        "name=\"is_deprecated\"",
+        "false",
+        "name=\"attached_file\"; filename=\"notes.txt\"",
+        "attachment payload",
+    ] {
+        assert!(body.contains(expected), "missing {expected} in {body}");
+    }
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn attachments_edit_patches_fields_as_json_and_files_as_multipart() {
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/userstories/attachments/555"))
+        .and(body_json(
+            json!({"description":"updated","is_deprecated":true,"order":3}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":555,"order":3})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let directory = tempdir().unwrap();
+    let config = directory.path().join("config.json");
+    write_config(&config, &server.uri(), "access", "refresh");
+
+    taiga(
+        &config,
+        &[
+            "userstory",
+            "attachments",
+            "edit",
+            "555",
+            "--description",
+            "updated",
+            "--deprecated",
+            "true",
+            "--order",
+            "3",
+        ],
+    )
+    .assert()
+    .success()
+    .stdout(contains("\"order\": 3"));
+    server.verify().await;
+    server.reset().await;
+
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/userstories/attachments/555"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":555,"name":"new.txt"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let replacement = directory.path().join("new.txt");
+    fs::write(&replacement, b"replacement bytes").unwrap();
+
+    taiga(
+        &config,
+        &[
+            "userstory",
+            "attachments",
+            "edit",
+            "555",
+            "--file",
+            replacement.to_str().unwrap(),
+        ],
+    )
+    .assert()
+    .success()
+    .stdout(contains("\"name\": \"new.txt\""));
+
+    let upload = upload_request(&server, "/api/v1/userstories/attachments/555").await;
+    let body = String::from_utf8(upload.body.clone()).unwrap();
+    assert!(
+        body.contains("name=\"attached_file\"; filename=\"new.txt\"")
+            && body.contains("replacement bytes"),
+        "file part missing in {body}"
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn attachments_edit_without_changes_fails_before_network() {
+    let server = MockServer::start().await;
+    let directory = tempdir().unwrap();
+    let config = directory.path().join("config.json");
+    write_config(&config, &server.uri(), "access", "refresh");
+
+    taiga(&config, &["issue", "attachments", "edit", "555"])
+        .assert()
+        .code(2)
+        .stderr(contains("needs --file or at least one field"));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn attachments_remove_deletes_only_after_confirmation() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/tasks/attachments/555"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let directory = tempdir().unwrap();
+    let config = directory.path().join("config.json");
+    write_config(&config, &server.uri(), "access", "refresh");
+
+    taiga(&config, &["task", "attachments", "remove", "555"])
+        .assert()
+        .code(2)
+        .stderr(contains("attachments remove requires --yes"));
+    assert!(server.received_requests().await.unwrap().is_empty());
+
+    taiga(&config, &["task", "attachments", "remove", "555", "--yes"])
+        .assert()
+        .success()
+        .stdout(contains("\"deleted\": true"));
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn attachments_download_writes_the_media_file_without_the_bearer() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/epics/attachments/555"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 555,
+            "name": "report.txt",
+            "url": format!("{}/media/attachments/report.txt?token=abc", server.uri()),
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/media/attachments/report.txt"))
+        .and(query_param("token", "abc"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"downloaded bytes".to_vec()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let directory = tempdir().unwrap();
+    let config = directory.path().join("config.json");
+    write_config(&config, &server.uri(), "access", "refresh");
+
+    taiga(
+        &config,
+        &[
+            "epic",
+            "attachments",
+            "download",
+            "555",
+            "--to",
+            directory.path().to_str().unwrap(),
+        ],
+    )
+    .assert()
+    .success()
+    .stdout(contains("\"size\": 16"));
+
+    let saved = directory.path().join("report.txt");
+    assert_eq!(fs::read(&saved).unwrap(), b"downloaded bytes");
+    let media = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.url.path() == "/media/attachments/report.txt")
+        .expect("media request");
+    assert!(
+        !media.headers.contains_key("authorization"),
+        "media host must not receive the session bearer"
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn attachments_list_scopes_the_query_to_the_object_and_its_project() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/issues/4242"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":4242,"project":7})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/issues/attachments"))
+        .and(query_param("object_id", "4242"))
+        .and(query_param("project", "7"))
+        .and(header("x-disable-pagination", "True"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{"id":555}])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let directory = tempdir().unwrap();
+    let config = directory.path().join("config.json");
+    write_config(&config, &server.uri(), "access", "refresh");
+
+    taiga(&config, &["issue", "attachments", "list", "4242"])
+        .assert()
+        .success()
+        .stdout(contains("\"id\": 555"));
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn attachments_reject_resources_without_attachments_before_network() {
+    let server = MockServer::start().await;
+    let directory = tempdir().unwrap();
+    let config = directory.path().join("config.json");
+    write_config(&config, &server.uri(), "access", "refresh");
+    let file = directory.path().join("notes.txt");
+    fs::write(&file, b"payload").unwrap();
+
+    taiga(
+        &config,
+        &["project", "attachments", "add", "7", file.to_str().unwrap()],
+    )
+    .assert()
+    .code(2)
+    .stderr(contains("attachments unavailable for this resource"));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+async fn upload_request(server: &MockServer, path: &str) -> wiremock::Request {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.url.path() == path && r.body.starts_with(b"--"))
+        .expect("multipart request")
+}
+
 /// Fake release archive for the platform this test binary was built for,
 /// holding `payload` where the CLI binary would be.
 fn release_archive(payload: &[u8]) -> (String, Vec<u8>) {

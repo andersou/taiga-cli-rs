@@ -5,7 +5,7 @@ use std::{
     collections::BTreeMap,
     fs,
     io::{self, IsTerminal, Read},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -14,8 +14,8 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use taiga_client::{
-    LoginRequest, NotificationId, PaginationMode, ProjectId, RefreshRequest, TaigaClient,
-    TaigaError, TokenPair,
+    AttachmentFields, AttachmentFile, LoginRequest, NotificationId, PaginationMode, ProjectId,
+    RefreshRequest, ResourceService, TaigaClient, TaigaError, TokenPair,
 };
 use thiserror::Error;
 
@@ -100,7 +100,8 @@ enum ResourceAction {
     Delete(DeleteArgs),
     History(HistoryArgs),
     Comments(HistoryArgs),
-    Attachments(IdArgs),
+    /// Manage the files attached to one story, task, issue, epic, or wiki page
+    Attachments(AttachmentCommand),
     Stats(IdArgs),
     Statuses(ProjectArgs),
     Metadata(ProjectArgs),
@@ -145,6 +146,75 @@ struct ProjectArgs {
     project: u64,
     #[arg(long)]
     page: Option<u32>,
+}
+#[derive(Args)]
+struct AttachmentCommand {
+    #[command(subcommand)]
+    action: AttachmentAction,
+}
+#[derive(Subcommand)]
+enum AttachmentAction {
+    /// List the attachments of one object
+    List(AttachmentListArgs),
+    /// Show one attachment
+    Get(IdArgs),
+    /// Upload a local file as a new attachment
+    Add(AttachmentAddArgs),
+    /// Change attachment fields, optionally replacing the stored file
+    Edit(AttachmentEditArgs),
+    /// Save the attached file locally
+    Download(AttachmentDownloadArgs),
+    /// Delete one attachment
+    Remove(DeleteArgs),
+}
+#[derive(Args)]
+struct AttachmentListArgs {
+    /// ID of the story, task, issue, epic, or wiki page
+    id: u64,
+    /// Request one page instead of every attachment
+    #[arg(long)]
+    page: Option<u32>,
+}
+#[derive(Args)]
+struct AttachmentAddArgs {
+    /// ID of the story, task, issue, epic, or wiki page
+    id: u64,
+    /// Local file to upload
+    file: PathBuf,
+    #[command(flatten)]
+    fields: AttachmentFieldArgs,
+}
+#[derive(Args)]
+struct AttachmentEditArgs {
+    /// Attachment ID
+    id: u64,
+    /// Replace the stored file with this local file
+    #[arg(long)]
+    file: Option<PathBuf>,
+    #[command(flatten)]
+    fields: AttachmentFieldArgs,
+}
+#[derive(Args)]
+struct AttachmentFieldArgs {
+    #[arg(long)]
+    description: Option<String>,
+    /// Mark the attachment as deprecated
+    #[arg(long)]
+    deprecated: Option<bool>,
+    /// Whether the attachment belongs to a comment
+    #[arg(long)]
+    from_comment: Option<bool>,
+    #[arg(long)]
+    order: Option<i64>,
+}
+#[derive(Args)]
+struct AttachmentDownloadArgs {
+    /// Attachment ID
+    id: u64,
+    /// Destination file or directory; defaults to the attachment name in
+    /// the current directory
+    #[arg(long)]
+    to: Option<PathBuf>,
 }
 #[derive(Args)]
 struct BodyArgs {
@@ -457,6 +527,146 @@ fn emit(output: Output, value: &impl Serialize) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Taiga exposes attachments only for the resources whose objects can
+/// carry them.
+fn ensure_attachments(path: &str) -> Result<(), AppError> {
+    match path {
+        "userstories" | "tasks" | "issues" | "epics" | "wiki" => Ok(()),
+        _ => Err(AppError::Usage(
+            "attachments unavailable for this resource".into(),
+        )),
+    }
+}
+
+/// Attachment endpoints require the owning project, which only the object
+/// itself reports.
+async fn object_project(service: &ResourceService<'_>, id: u64) -> Result<ProjectId, AppError> {
+    service
+        .get::<Value>(id)
+        .await?
+        .get("project")
+        .and_then(Value::as_u64)
+        .map(ProjectId)
+        .ok_or_else(|| AppError::Usage("resource lacks project".into()))
+}
+
+fn attachment_fields(args: &AttachmentFieldArgs) -> AttachmentFields {
+    AttachmentFields {
+        description: args.description.clone(),
+        is_deprecated: args.deprecated,
+        from_comment: args.from_comment,
+        order: args.order,
+    }
+}
+
+async fn read_attachment_file(path: &Path) -> Result<AttachmentFile, AppError> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| AppError::Usage("attachment path must end with a file name".into()))?
+        .to_owned();
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|e| AppError::Usage(format!("cannot read {}: {e}", path.display())))?;
+    Ok(AttachmentFile { name, bytes })
+}
+
+/// Where `download` writes: an explicit file, a directory joined with the
+/// stored name, or that name in the current directory.
+fn download_target(to: Option<&Path>, name: &str) -> PathBuf {
+    let name = Path::new(name)
+        .file_name()
+        .map_or_else(|| PathBuf::from("attachment"), PathBuf::from);
+    match to {
+        Some(path) if path.is_dir() => path.join(name),
+        Some(path) => path.to_owned(),
+        None => name,
+    }
+}
+
+async fn attachments(
+    client: &TaigaClient,
+    path: &str,
+    service: &ResourceService<'_>,
+    action: &AttachmentAction,
+    output: Output,
+) -> Result<(), AppError> {
+    ensure_attachments(path)?;
+    match action {
+        AttachmentAction::List(args) => {
+            let project = object_project(service, args.id).await?;
+            let mode = match args.page {
+                Some(0) => return Err(AppError::Usage("--page must be positive".into())),
+                Some(n) => PaginationMode::Page(n),
+                None => PaginationMode::All,
+            };
+            emit(
+                output,
+                &service.attachments::<Value>(project, args.id, mode).await?,
+            )
+        }
+        AttachmentAction::Get(args) => emit(output, &service.attachment::<Value>(args.id).await?),
+        AttachmentAction::Add(args) => {
+            let file = read_attachment_file(&args.file).await?;
+            let project = object_project(service, args.id).await?;
+            emit(
+                output,
+                &service
+                    .create_attachment::<Value>(
+                        project,
+                        args.id,
+                        file,
+                        &attachment_fields(&args.fields),
+                    )
+                    .await?,
+            )
+        }
+        AttachmentAction::Edit(args) => {
+            let file = match &args.file {
+                Some(path) => Some(read_attachment_file(path).await?),
+                None => None,
+            };
+            let fields = attachment_fields(&args.fields);
+            if file.is_none() && fields.is_empty() {
+                return Err(AppError::Usage(
+                    "attachments edit needs --file or at least one field".into(),
+                ));
+            }
+            emit(
+                output,
+                &service
+                    .update_attachment::<Value>(args.id, file, &fields)
+                    .await?,
+            )
+        }
+        AttachmentAction::Download(args) => {
+            let attachment = service.attachment::<Value>(args.id).await?;
+            let url = attachment
+                .get("url")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AppError::Usage("attachment lacks a download URL".into()))?;
+            let name = attachment
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("attachment");
+            let target = download_target(args.to.as_deref(), name);
+            let bytes = client.download(url).await?;
+            tokio::fs::write(&target, &bytes).await?;
+            emit(
+                output,
+                &json!({"id":args.id,"path":target,"size":bytes.len()}),
+            )
+        }
+        AttachmentAction::Remove(args) => {
+            if !args.yes {
+                return Err(AppError::Usage("attachments remove requires --yes".into()));
+            }
+            service.delete_attachment(args.id).await?;
+            emit(output, &json!({"deleted":true,"id":args.id}))
+        }
+    }
+}
+
 async fn resource(
     client: &TaigaClient,
     path: &str,
@@ -554,25 +764,8 @@ async fn resource(
                     .await?,
             )
         }
-        ResourceAction::Attachments(args) => {
-            let current = service.get::<Value>(args.id).await?;
-            let project = current
-                .get("project")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| AppError::Usage("resource lacks project".into()))?;
-            emit(
-                output,
-                &client
-                    .list_path::<Value>(
-                        &format!("{path}/attachments"),
-                        &[
-                            ("object_id".into(), args.id.to_string()),
-                            ("project".into(), project.to_string()),
-                        ],
-                        PaginationMode::All,
-                    )
-                    .await?,
-            )
+        ResourceAction::Attachments(command) => {
+            attachments(client, path, &service, &command.action, output).await
         }
         ResourceAction::Stats(args) => emit(
             output,

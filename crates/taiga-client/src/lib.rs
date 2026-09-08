@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, fmt, time::Duration};
 
 use chrono::{DateTime, NaiveDate, Utc};
-use reqwest::{Method, StatusCode, header};
+use reqwest::{Method, Response, StatusCode, header, multipart};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -280,6 +280,69 @@ impl TaigaClient {
     pub async fn delete_path(&self, path: &str) -> Result<(), TaigaError> {
         self.empty(Method::DELETE, path, &[], None).await
     }
+    /// Fetches raw bytes from an absolute media URL, as returned in an
+    /// attachment's `url`. Media hosts authenticate with the token embedded
+    /// in the URL, so the session bearer is deliberately not sent.
+    pub async fn download(&self, url: &str) -> Result<Vec<u8>, TaigaError> {
+        let target = Url::parse(url).map_err(|e| TaigaError::InvalidUrl(e.to_string()))?;
+        if !matches!(target.scheme(), "http" | "https") {
+            return Err(TaigaError::InvalidUrl(
+                "attachment URL must be HTTP(S)".into(),
+            ));
+        }
+        let response = self
+            .http
+            .get(target)
+            .send()
+            .await
+            .map_err(transport_error)?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.map_err(transport_error)?;
+            return Err(map_error(status, &text, None));
+        }
+        Ok(response.bytes().await.map_err(transport_error)?.into())
+    }
+    /// Sends one file with `multipart/form-data`, the encoding Taiga's
+    /// attachment endpoints require. `fields` carries the text parts that
+    /// accompany the file (`object_id`, `project`, `description`, ...).
+    async fn upload<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        fields: &[(String, String)],
+        file_field: &str,
+        file: AttachmentFile,
+    ) -> Result<T, TaigaError> {
+        let token = self
+            .token
+            .as_ref()
+            .ok_or_else(|| TaigaError::Unauthorized {
+                message: "no bearer token configured".into(),
+            })?;
+        let mut form = multipart::Form::new();
+        for (key, value) in fields {
+            form = form.text(key.clone(), value.clone());
+        }
+        form = form.part(
+            file_field.to_owned(),
+            multipart::Part::bytes(file.bytes)
+                .file_name(file.name)
+                .mime_str("application/octet-stream")
+                .map_err(transport_error)?,
+        );
+        let mut request = self
+            .http
+            .request(method, self.url(path)?)
+            .header(header::ACCEPT, "application/json")
+            .bearer_auth(token.expose_secret())
+            .multipart(form);
+        if let Some(language) = &self.language {
+            request = request.header(header::ACCEPT_LANGUAGE, language);
+        }
+        let response = request.send().await.map_err(transport_error)?;
+        decode(response, None).await.map(|(value, _)| value)
+    }
 
     fn url(&self, path: &str) -> Result<Url, TaigaError> {
         self.base
@@ -327,22 +390,7 @@ impl TaigaClient {
             request = request.json(&body);
         }
         let response = request.send().await.map_err(transport_error)?;
-        let status = response.status();
-        let headers = response.headers().clone();
-        let text = response.text().await.map_err(transport_error)?;
-        if !status.is_success() {
-            return Err(map_error(
-                status,
-                &text,
-                headers
-                    .get(header::RETRY_AFTER)
-                    .and_then(|h| h.to_str().ok())
-                    .map(str::to_owned),
-            ));
-        }
-        let page = pagination.and_then(|_| parse_pagination(&headers));
-        let value = serde_json::from_str(&text)?;
-        Ok((serde_json::from_value(value)?, page))
+        decode(response, pagination).await
     }
     async fn empty(
         &self,
@@ -375,6 +423,27 @@ impl TaigaClient {
             Err(map_error(status, &text, None))
         }
     }
+}
+
+/// Turns a finished response into a typed body, mapping HTTP failures to
+/// `TaigaError` and reading pagination headers when the caller asked for
+/// a paginated list.
+async fn decode<T: DeserializeOwned>(
+    response: Response,
+    pagination: Option<PaginationMode>,
+) -> Result<(T, Option<Pagination>), TaigaError> {
+    let status = response.status();
+    let page = pagination.and_then(|_| parse_pagination(response.headers()));
+    let retry_after = response
+        .headers()
+        .get(header::RETRY_AFTER)
+        .and_then(|h| h.to_str().ok())
+        .map(str::to_owned);
+    let text = response.text().await.map_err(transport_error)?;
+    if !status.is_success() {
+        return Err(map_error(status, &text, retry_after));
+    }
+    Ok((serde_json::from_str(&text)?, page))
 }
 
 fn transport_error(error: reqwest::Error) -> TaigaError {
@@ -471,6 +540,65 @@ impl AuthService<'_> {
             )
             .await
             .map(|(v, _)| v)
+    }
+}
+
+/// One file to upload: the name Taiga stores and its bytes.
+#[derive(Clone, Debug)]
+pub struct AttachmentFile {
+    pub name: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Optional attachment fields shared by create and update. Omitted fields
+/// are left untouched by `PATCH` and defaulted by the API on create.
+#[derive(Clone, Debug, Default)]
+pub struct AttachmentFields {
+    pub description: Option<String>,
+    pub is_deprecated: Option<bool>,
+    pub from_comment: Option<bool>,
+    pub order: Option<i64>,
+}
+impl AttachmentFields {
+    pub fn is_empty(&self) -> bool {
+        self.description.is_none()
+            && self.is_deprecated.is_none()
+            && self.from_comment.is_none()
+            && self.order.is_none()
+    }
+    /// Text parts for a multipart request; Django parses these booleans and
+    /// integers from their string forms.
+    fn text_parts(&self) -> Vec<(String, String)> {
+        let mut parts = Vec::new();
+        if let Some(description) = &self.description {
+            parts.push(("description".to_owned(), description.clone()));
+        }
+        if let Some(deprecated) = self.is_deprecated {
+            parts.push(("is_deprecated".to_owned(), deprecated.to_string()));
+        }
+        if let Some(from_comment) = self.from_comment {
+            parts.push(("from_comment".to_owned(), from_comment.to_string()));
+        }
+        if let Some(order) = self.order {
+            parts.push(("order".to_owned(), order.to_string()));
+        }
+        parts
+    }
+    fn json(&self) -> Value {
+        let mut body = serde_json::Map::new();
+        if let Some(description) = &self.description {
+            body.insert("description".into(), Value::from(description.clone()));
+        }
+        if let Some(deprecated) = self.is_deprecated {
+            body.insert("is_deprecated".into(), Value::from(deprecated));
+        }
+        if let Some(from_comment) = self.from_comment {
+            body.insert("from_comment".into(), Value::from(from_comment));
+        }
+        if let Some(order) = self.order {
+            body.insert("order".into(), Value::from(order));
+        }
+        Value::Object(body)
     }
 }
 
@@ -582,6 +710,102 @@ impl<'a> ResourceService<'a> {
             )
             .await?;
         Ok(ListResponse { items, pagination })
+    }
+    /// Lists the attachments of one object of this resource. Taiga requires
+    /// both the object and its project.
+    pub async fn attachments<T: DeserializeOwned>(
+        &self,
+        project: ProjectId,
+        object_id: u64,
+        pagination: PaginationMode,
+    ) -> Result<ListResponse<T>, TaigaError> {
+        let (items, pagination) = self
+            .client
+            .request(
+                Method::GET,
+                &self.attachments_path(),
+                &[
+                    ("object_id".into(), object_id.to_string()),
+                    ("project".into(), project.0.to_string()),
+                ],
+                None,
+                true,
+                Some(pagination),
+            )
+            .await?;
+        Ok(ListResponse { items, pagination })
+    }
+    pub async fn attachment<T: DeserializeOwned>(&self, id: u64) -> Result<T, TaigaError> {
+        self.client
+            .request(
+                Method::GET,
+                &format!("{}/{}", self.attachments_path(), id),
+                &[],
+                None,
+                true,
+                None,
+            )
+            .await
+            .map(|(v, _)| v)
+    }
+    pub async fn create_attachment<T: DeserializeOwned>(
+        &self,
+        project: ProjectId,
+        object_id: u64,
+        file: AttachmentFile,
+        fields: &AttachmentFields,
+    ) -> Result<T, TaigaError> {
+        let mut parts = vec![
+            ("object_id".to_owned(), object_id.to_string()),
+            ("project".to_owned(), project.0.to_string()),
+        ];
+        parts.extend(fields.text_parts());
+        self.client
+            .upload(
+                Method::POST,
+                &self.attachments_path(),
+                &parts,
+                "attached_file",
+                file,
+            )
+            .await
+    }
+    /// Partially updates one attachment (`PATCH`). Passing `file` replaces
+    /// the stored file, which the API only accepts as multipart.
+    pub async fn update_attachment<T: DeserializeOwned>(
+        &self,
+        id: u64,
+        file: Option<AttachmentFile>,
+        fields: &AttachmentFields,
+    ) -> Result<T, TaigaError> {
+        let path = format!("{}/{}", self.attachments_path(), id);
+        match file {
+            Some(file) => {
+                self.client
+                    .upload(
+                        Method::PATCH,
+                        &path,
+                        &fields.text_parts(),
+                        "attached_file",
+                        file,
+                    )
+                    .await
+            }
+            None => self.client.patch_path(&path, &fields.json()).await,
+        }
+    }
+    pub async fn delete_attachment(&self, id: u64) -> Result<(), TaigaError> {
+        self.client
+            .empty(
+                Method::DELETE,
+                &format!("{}/{}", self.attachments_path(), id),
+                &[],
+                None,
+            )
+            .await
+    }
+    fn attachments_path(&self) -> String {
+        format!("{}/attachments", self.path)
     }
 }
 

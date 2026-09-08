@@ -15,7 +15,7 @@ flate2 = "1.1"
 futures = "0.3"
 keyring = "4.2"
 predicates = "3.1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 rpassword = "7.4"
 self-replace = "1.5"
 semver = "1.0"

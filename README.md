@@ -6,6 +6,7 @@ Rust CLI and reusable async client for the [Taiga REST API](https://docs.taiga.i
 
 - Normal Taiga username/email and password authentication, token refresh, and private local token storage.
 - Projects, memberships, roles, statistics, user stories, tasks, issues, epics, milestones, wiki, search, notifications, and timelines.
+- Full attachment handling for user stories, tasks, issues, epics, and wiki pages: list, get, upload, edit fields, replace the stored file, download, and delete.
 - Optimistic-concurrency updates using Taiga resource versions.
 - Project-scoped and all-visible-project full-text search.
 - Precompiled binaries published as GitHub release archives for Linux x86_64, Windows x86_64, Intel macOS, and Apple Silicon macOS.
@@ -110,6 +111,10 @@ taiga-cli userstory list --project 123 --milestone 17
 taiga-cli task status 42 7
 taiga-cli issue create --project 123 --subject "Broken API response"
 taiga-cli epic stories list 9
+taiga-cli issue attachments list 4567
+taiga-cli issue attachments add 4567 ./server.log --description "failing request log"
+taiga-cli issue attachments download 5387112 --to ./downloads/
+taiga-cli issue attachments remove 5387112 --yes
 taiga-cli milestone stats 17
 taiga-cli wiki get 42
 taiga-cli search "authentication" --project 123

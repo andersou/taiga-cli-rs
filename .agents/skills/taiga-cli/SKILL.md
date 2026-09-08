@@ -69,7 +69,7 @@ taiga-cli issue create --project 123 --subject "Broken API response" --descripti
 taiga-cli issue edit 4567 --status 5                # needs at least one field
 taiga-cli issue delete 4567 --yes                   # refuses without --yes
 taiga-cli userstory history 4567 --kind comment     # comments only; --kind activity for field changes
-taiga-cli userstory attachments 4567
+taiga-cli userstory attachments list 4567
 taiga-cli project stats 123                         # also: taiga milestone stats 17
 ```
 
@@ -77,6 +77,7 @@ taiga-cli project stats 123                         # also: taiga milestone stat
 - `edit` fetches the current resource `version` and sends it back, so concurrent edits fail with exit code 6 instead of silently overwriting; just re-run.
 - `--data '<json object>'` on `create`/`edit` merges arbitrary Taiga API fields, e.g. `--data '{"assigned_to":12,"milestone":17}'`. Explicit flags override `--data` keys.
 - Wiki pages have no subject; create them through `--data`: `taiga wiki create --data '{"project":123,"slug":"home","content":"..."}'`.
+- Attachments: `attachments list|get|add|edit|download|remove` for `userstory`, `task`, `issue`, `epic`, and `wiki`. See the section below.
 
 ## Resource-specific commands
 
@@ -87,6 +88,24 @@ taiga-cli epic stories add 9 4567
 taiga-cli epic stories reorder 9 4567 --order 2
 taiga-cli epic stories remove 9 4567 --yes
 ```
+
+## Attachments
+
+```sh
+taiga-cli issue attachments list 4567                       # every attachment of issue 4567
+taiga-cli issue attachments get 5387112                     # one attachment by attachment ID
+taiga-cli issue attachments add 4567 ./server.log --description "failing request log"
+taiga-cli issue attachments edit 5387112 --description "..." --deprecated true --order 1
+taiga-cli issue attachments edit 5387112 --file ./server-v2.log    # replaces the stored file
+taiga-cli issue attachments download 5387112 --to ./downloads/     # file or directory
+taiga-cli issue attachments remove 5387112 --yes            # refuses without --yes
+```
+
+- Works the same for `userstory`, `task`, `epic`, and `wiki`; other resources fail with `attachments unavailable for this resource` before any request.
+- `list` and `add` take the **object ID** (story/task/issue/epic/wiki page); `get`, `edit`, `download`, and `remove` take the **attachment ID**. The owning project is read from the object, so it never has to be passed.
+- `list` returns every attachment by default; `--page N` requests a single page.
+- `add` and `edit` accept `--description`, `--deprecated <bool>`, `--from-comment <bool>`, and `--order <n>`; `edit` needs `--file` or at least one field.
+- `download` writes the name Taiga stored when `--to` is a directory or omitted, and prints `{"id":…, "path":…, "size":…}`.
 
 ## Current sprint and current stories
 
