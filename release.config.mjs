@@ -3,7 +3,10 @@ const conventionalCommits = {
   presetConfig: {},
 };
 
+// The first matching rule wins, so the breaking rule must precede the
+// per-type rules; otherwise a breaking `feat` would only bump the minor.
 const releaseRules = [
+  { breaking: true, release: "major" },
   { type: "feat", release: "minor" },
   { type: "fix", release: "patch" },
   { type: "perf", release: "patch" },
